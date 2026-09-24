@@ -223,32 +223,54 @@ def groq_transcribe(audio: np.ndarray, *, prompt: str = "", api_key: str = "") -
 
 # ═══════════════════════════════════════════════════
 
-W, H   = 228, 52
-RADIUS = H // 2
-MIC_X = 22
+# Компактная «пилюля» в духе Wispr Flow: бары по центру, кнопки ≡ и ×
+# появляются по краям при наведении.
+W, H   = 112, 30
+WIN_ALPHA = 0.97
 
-BG         = "#0D0D0F"
-PILL       = "#1C1C1E"
-C_IDLE     = "#3A3A3C"
-C_REC      = "#FF375F"
-C_PROC     = "#FF9F0A"
-C_MIC_BG     = "#2C2C2E"   # круг микрофона в покое
-C_MIC_BG_ON  = "#FF375F"   # круг микрофона при записи
-C_MIC_SYM    = "#D7DBE2"   # символ микрофона в покое
-C_MIC_SYM_ON = "#FF375F"   # символ микрофона при записи
-C_CLOSE_BG   = "#2C2C2E"
-C_CLOSE_HV   = "#3A3A3C"
-C_CLOSE_X    = "#8E8E93"
-C_LOG_BG     = "#2C2C2E"
-C_LOG_HV     = "#3A3A3C"
-C_LOG_X      = "#8E8E93"
+PILL          = "#0B0B0D"
+C_BORDER      = "#3A3A40"   # обводка в покое
+C_BORDER_REC  = "#7A2638"   # обводка при записи
+C_BORDER_PROC = "#7A5214"   # обводка при обработке
+C_IDLE        = "#5E5E66"
+C_REC         = "#FF375F"
+C_PROC        = "#FF9F0A"
+C_SPINNER     = "#8E8E93"
+C_BTN_BG      = "#232327"
+C_BTN_HV      = "#3A3A40"
+C_BTN_FG      = "#A1A1A8"
 
-BAR_COUNT = 7
-BAR_W     = 3
-BAR_STEP  = 7
-BARS_X    = 74
-BAR_MIN   = 2.0
-BAR_MAX   = 18.0
+BTN_R    = 9
+LOGS_CX  = 16
+CLOSE_CX = W - 16
+
+BAR_COUNT = 9
+BAR_W     = 2.5
+BAR_STEP  = 5
+BARS_X    = (W - (BAR_COUNT - 1) * BAR_STEP) / 2   # центр первого бара
+BAR_MIN   = 1.25
+BAR_MAX   = 8.5
+
+# Полосы спектра: лог-шкала, низкие частоты в центре, зеркально к краям.
+# Наклон поднимает тихие высокие полосы, огибающая держит центр выше краёв
+# (подобрано на живом голосе: центр ~0.65, края ~0.15 от максимума).
+EQ_BANDS         = (BAR_COUNT + 1) // 2          # 5 полос на 9 баров
+EQ_BAND_EDGES_HZ = (200.0, 5000.0)
+EQ_BAND_TILT     = np.array([1.0, 1.2, 1.6, 2.4, 3.4], dtype=np.float32)
+EQ_ENVELOPE      = np.array([1.0, 0.9, 0.78, 0.66, 0.55], dtype=np.float32)
+EQ_MIRROR        = np.array(
+    [min(EQ_BANDS - 1, abs(i - BAR_COUNT // 2)) for i in range(BAR_COUNT)]
+)
+
+# Окно логов
+LOG_BG    = "#111114"
+LOG_PANEL = "#18181C"
+LOG_FG    = "#ECECF1"
+LOG_DIM   = "#8E8E96"
+LOG_SEL   = "#34343C"
+LOG_BTN   = "#26262C"
+LOG_BTN_HV = "#34343C"
+UI_FONT   = "Helvetica Neue"
 
 # EQ smoothing
 EQ_ATTACK        = 0.86
@@ -685,15 +707,20 @@ def _likely_silence_hallucination(text: str, avg_no_speech: float) -> bool:
     return avg_no_speech >= SILENCE_SKIP_NO_SPEECH and len(text.strip()) <= SILENCE_SKIP_MAX_CHARS
 
 
-def pill_points(x1, y1, x2, y2, r):
-    return [
-        x1+r, y1,   x2-r, y1,
-        x2,   y1,   x2,   y1+r,
-        x2,   y2-r, x2,   y2,
-        x2-r, y2,   x1+r, y2,
-        x1,   y2,   x1,   y2-r,
-        x1,   y1+r, x1,   y1,
-    ]
+def _eq_band_bins(n: int) -> list:
+    """Границы полос эквалайзера в бинах rfft для кадра длиной n."""
+    edges_hz = np.geomspace(EQ_BAND_EDGES_HZ[0], EQ_BAND_EDGES_HZ[1], EQ_BANDS + 1)
+    n_bins = n // 2 + 1
+    edges = np.clip(np.round(edges_hz * n / SAMPLE_RATE).astype(int), 1, n_bins - 1)
+    return [(int(a), int(max(b, a + 1))) for a, b in zip(edges[:-1], edges[1:])]
+
+
+def _plural_records(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} запись"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} записи"
+    return f"{n} записей"
 
 
 class App:
@@ -724,14 +751,16 @@ class App:
         self._eq_levels = np.zeros(BAR_COUNT, dtype=np.float32)
         self._eq_smooth = np.zeros(BAR_COUNT, dtype=np.float32)
         self._rms_smooth = 0.0
+        self._eq_window = None      # окно Хэннинга, считается один раз
+        self._eq_band_idx = []      # границы полос в бинах rfft
 
-        # PNG-иконка микрофона
-        self._mic_photo_idle   = None
-        self._mic_photo_active = None
-        self._mic_item         = None
+        self._anim_running     = False
+        self._bar_color        = None
         self._logs_win         = None
         self._logs_list        = None
         self._logs_text        = None
+        self._logs_count       = None
+        self._copy_btn         = None
         self._log_records      = []
         self._logs_bounds      = (0, 0, 0, 0)
         self._close_bounds     = (0, 0, 0, 0)
@@ -746,9 +775,9 @@ class App:
         except tk.TclError:
             pass
         self.root.attributes("-topmost", True)
-        self.root.attributes("-alpha", 0.96)
-        self.root.configure(bg=BG)
-        self._load_mic_images()
+        self.root.attributes("-alpha", WIN_ALPHA)
+        self._make_borderless()
+        self.root.configure(bg=PILL)
 
         sx = self.root.winfo_screenwidth()  - W - 28
         sy = self.root.winfo_screenheight() - H - 96
@@ -756,54 +785,59 @@ class App:
 
         # ── Canvas ───────────────────────────────────────────────
         self.cv = tk.Canvas(self.root, width=W, height=H,
-                            bg=BG, highlightthickness=0)
+                            bg=PILL, highlightthickness=0)
         self.cv.pack()
 
-        # Пилл
-        self.cv.create_polygon(
-            pill_points(0, 0, W, H, RADIUS),
-            smooth=True, fill=PILL, outline=""
+        # Пилюля: толстая линия со скруглёнными концами даёт ровные полукруглые
+        # торцы (вершины многоугольника Tk округляет до целых точек — выходят
+        # грани). Нижняя линия — обводка, верхняя на 2pt уже — заливка.
+        r = H / 2
+        self._pill_border = self.cv.create_line(
+            r, r, W - r, r, width=H, capstyle="round", fill=C_BORDER
+        )
+        self.cv.create_line(
+            r, r, W - r, r, width=H - 2, capstyle="round", fill=PILL
         )
 
-        # Иконка микрофона (рисованная)
-        self._draw_mic(recording=False)
-
-        # Спиннер загрузки
-        self.spinner = self.cv.create_text(
-            28, H // 2, text="◌", font=("Helvetica", 22), fill="#636366"
+        # Спиннер загрузки (виден, пока модель не готова): вращающаяся дуга
+        sr = 6
+        self.spinner = self.cv.create_arc(
+            W / 2 - sr, H / 2 - sr, W / 2 + sr, H / 2 + sr,
+            start=90, extent=270, style="arc", outline=C_SPINNER, width=1.6
         )
-        self.cv.itemconfig("mic", state="hidden")
 
-        # Эквалайзер
-        cy = H // 2
+        # Эквалайзер: бары-линии со скруглёнными концами
+        cy = H / 2
         self.bars = []
         for i in range(BAR_COUNT):
             x = BARS_X + i * BAR_STEP
-            b = self.cv.create_rectangle(
-                x, cy - BAR_MIN, x + BAR_W, cy + BAR_MIN,
-                fill=C_IDLE, outline="", tags="bar"
+            b = self.cv.create_line(
+                x, cy - BAR_MIN, x, cy + BAR_MIN,
+                fill=C_IDLE, width=BAR_W, capstyle="round",
+                tags="bar", state="hidden"
             )
             self.bars.append((b, x))
 
-        # Кнопка закрытия (рисованная)
-        self._draw_close()
+        # Кнопки ≡ (логи) и × (выход): скрыты, показываются при наведении
         self._draw_logs_button()
+        self._draw_close()
+        self.cv.itemconfig("ctl", state="hidden")
 
         # ── Биндинги ────────────────────────────────────────────
         self.cv.tag_bind("close", "<Button-1>", self._quit)
         self.cv.tag_bind("close", "<Enter>",
-                         lambda e: self.cv.itemconfig(self._close_bg,
-                                                      fill=C_CLOSE_HV))
+                         lambda e: self.cv.itemconfig(self._close_bg, fill=C_BTN_HV))
         self.cv.tag_bind("close", "<Leave>",
-                         lambda e: self.cv.itemconfig(self._close_bg,
-                                                      fill=C_CLOSE_BG))
+                         lambda e: self.cv.itemconfig(self._close_bg, fill=C_BTN_BG))
         self.cv.tag_bind("logs", "<Button-1>", self._toggle_logs_window)
         self.cv.tag_bind("logs", "<ButtonRelease-1>", lambda _e: "break")
         self.cv.tag_bind("logs", "<Enter>",
-                         lambda e: self.cv.itemconfig(self._logs_bg, fill=C_LOG_HV))
+                         lambda e: self.cv.itemconfig(self._logs_bg, fill=C_BTN_HV))
         self.cv.tag_bind("logs", "<Leave>",
-                         lambda e: self.cv.itemconfig(self._logs_bg, fill=C_LOG_BG))
+                         lambda e: self.cv.itemconfig(self._logs_bg, fill=C_BTN_BG))
 
+        self.cv.bind("<Enter>", self._show_controls)
+        self.cv.bind("<Leave>", self._hide_controls)
         self.cv.bind("<ButtonPress-1>",  self._press)
         self.cv.bind("<B1-Motion>",       self._motion)
         self.cv.bind("<ButtonRelease-1>", self._release)
@@ -817,7 +851,7 @@ class App:
             log("Accessibility not granted: auto-paste and hold-key may not work")
             self._open_privacy_panel("Accessibility")
         self._track_app()
-        self._tick()
+        self._kick_anim()
         threading.Thread(target=self._load_model, daemon=True).start()
 
     def _normalize_hold_key_mode(self, raw: str) -> str:
@@ -929,55 +963,43 @@ class App:
             self._stop_rec()
         self._hold_started_recording = False
 
-    # ── Загрузка PNG-иконки ─────────────────────────────────────
-    def _load_mic_images(self):
+    # ── Окно без рамки ──────────────────────────────────────────
+    def _make_borderless(self):
+        """
+        Tk 9 на macOS игнорирует overrideredirect: у окна остаётся системная
+        шапка «tk» со светофором (+28pt по высоте). Снимаем её явным
+        -stylemask {}.
+
+        Прозрачный фон средствами Tk 9 не получить: окно рисуется в битмап
+        без альфа-канала, systemTransparent выходит чёрным. Поэтому форму
+        пилюли даёт маска слоя окна со скруглением H/2, а -transparent
+        убирает непрозрачный фон окна, чтобы срезанные углы стали прозрачными.
+        """
         try:
-            from PIL import Image, ImageTk
-            from pathlib import Path
-
-            # По умолчанию используем канвас-иконку (как на референсе UI).
-            if not _env_bool("WHISPERMAC_USE_PNG_MIC_ICON", True):
-                raise FileNotFoundError("PNG mic icon disabled by default")
-
-            env_icon = os.getenv("WHISPERMAC_MIC_ICON")
-            candidates = [
-                Path(env_icon).expanduser() if env_icon else None,
-                Path.home() / "Downloads" / "микро.png",
-                Path.home() / "Downloads" / "micro.png",
-                Path(__file__).resolve().parent / "assets" / "mic.png",
-            ]
-            icon_path = None
-            for path in candidates:
-                if path and path.exists():
-                    icon_path = path
-                    break
-
-            if icon_path is None:
-                raise FileNotFoundError("No mic icon found")
-
-            img  = Image.open(icon_path).convert("RGBA")
-            img  = img.resize((28, 28), Image.LANCZOS)
-            data = np.array(img, dtype=np.uint8)
-
-            # Убираем светлый фон → прозрачность
-            white = (data[:,:,0] > 200) & (data[:,:,1] > 200) & (data[:,:,2] > 200)
-            data[white, 3] = 0
-            mask = data[:,:,3] > 10
-
-            # Idle: серый (#8E8E93)
-            d_idle = data.copy()
-            d_idle[mask, 0] = 0xD7
-            d_idle[mask, 1] = 0xDB
-            d_idle[mask, 2] = 0xE2
-
-            # Active: оригинальный розовый
-            d_active = data.copy()
-
-            self._mic_photo_idle   = ImageTk.PhotoImage(Image.fromarray(d_idle,   "RGBA"))
-            self._mic_photo_active = ImageTk.PhotoImage(Image.fromarray(d_active, "RGBA"))
-            log(f"Иконка микрофона загружена: {icon_path}")
-        except Exception as ex:
-            log(f"PNG-иконка недоступна, используем canvas: {ex}")
+            self.root.attributes("-stylemask", "")
+        except tk.TclError:
+            pass  # Tk 8.6: -stylemask нет, там overrideredirect работает сам
+        try:
+            self.root.attributes("-transparent", True)
+        except tk.TclError as ex:
+            log(f"Прозрачный фон окна недоступен: {ex}")
+            return
+        try:
+            from AppKit import NSApplication
+            # Кроме нашего окна у Tk есть служебное скрытое TKWindow с рамкой —
+            # наше узнаём по снятой рамке и прозрачности.
+            for win in NSApplication.sharedApplication().windows():
+                if (win.className() != "TKWindow" or win.styleMask() != 0
+                        or win.isOpaque()):
+                    continue
+                view = win.contentView()
+                view.setWantsLayer_(True)
+                view.layer().setCornerRadius_(H / 2)
+                view.layer().setMasksToBounds_(True)
+                return
+            log("Скругление окна: окно пилюли не найдено")
+        except Exception as ex:  # noqa: BLE001
+            log(f"Скругление окна недоступно: {ex}")
 
     def _open_privacy_panel(self, key: str):
         try:
@@ -988,92 +1010,56 @@ class App:
         except Exception as ex:
             log(f"Не удалось открыть настройки Privacy_{key}: {ex}")
 
-    # ── Рисование иконок ────────────────────────────────────────
-    def _draw_mic(self, recording=False):
-        """Иконка микрофона — PNG если доступен, иначе canvas-примитивы."""
-        x, cy = MIC_X, H // 2
+    # ── Рисование кнопок и состояния ────────────────────────────
+    def _apply_state_style(self):
+        """Цвет баров и обводки: серый — покой, красный — запись, жёлтый — обработка."""
+        if self.recording:
+            bar, border = C_REC, C_BORDER_REC
+        elif self.processing:
+            bar, border = C_PROC, C_BORDER_PROC
+        else:
+            bar, border = C_IDLE, C_BORDER
+        if bar != self._bar_color:
+            self.cv.itemconfig("bar", fill=bar)
+            self._bar_color = bar
+        self.cv.itemconfig(self._pill_border, fill=border)
 
-        if self._mic_photo_idle and self._mic_photo_active:
-            photo = self._mic_photo_active if recording else self._mic_photo_idle
-            self._mic_item = self.cv.create_image(
-                x, cy, image=photo, anchor="center", tags="mic"
-            )
-            return
+    def _show_controls(self, _event=None):
+        self.cv.itemconfig("ctl", state="normal")
 
-        # ── Fallback: canvas-примитивы (классический стиль без круга) ──────
-        sym = C_MIC_SYM_ON if recording else C_MIC_SYM
-
-        cw, ch, lw = 8, 11, 1.8
-        cap_top = cy - 7
-        cap_bot = cap_top + ch
-        self.cv.create_arc(x-cw//2, cap_top, x+cw//2, cap_top+cw,
-                           start=0, extent=180, style="arc",
-                           outline=sym, width=lw, tags=("mic", "mic_sym"))
-        self.cv.create_line(x-cw//2, cap_top+cw//2, x-cw//2, cap_bot,
-                            fill=sym, width=lw, tags=("mic", "mic_sym"))
-        self.cv.create_line(x+cw//2, cap_top+cw//2, x+cw//2, cap_bot,
-                            fill=sym, width=lw, tags=("mic", "mic_sym"))
-        self.cv.create_arc(x-cw//2, cap_bot-cw, x+cw//2, cap_bot,
-                           start=180, extent=180, style="arc",
-                           outline=sym, width=lw, tags=("mic", "mic_sym"))
-        sr = 5
-        self.cv.create_arc(x-sr, cap_bot, x+sr, cap_bot+sr*2,
-                           start=0, extent=-180, style="arc",
-                           outline=sym, width=lw, tags=("mic", "mic_sym"))
-        self.cv.create_line(x-4, cap_bot+sr*2, x+4, cap_bot+sr*2,
-                            fill=sym, width=lw, capstyle="round",
-                            tags=("mic", "mic_sym"))
-
-    def _set_mic_color(self, recording=False):
-        if self._mic_item and self._mic_photo_idle and self._mic_photo_active:
-            photo = self._mic_photo_active if recording else self._mic_photo_idle
-            self.cv.itemconfig(self._mic_item, image=photo)
-            self._current_mic_photo = photo   # не допускаем garbage collection
-            return
-
-        # Fallback: canvas-примитивы
-        sym = C_MIC_SYM_ON if recording else C_MIC_SYM
-        for item in self.cv.find_withtag("mic_sym"):
-            t = self.cv.type(item)
-            if t == "line":
-                self.cv.itemconfig(item, fill=sym)
-            elif t == "arc":
-                self.cv.itemconfig(item, outline=sym)
+    def _hide_controls(self, _event=None):
+        self.cv.itemconfig("ctl", state="hidden")
+        self.cv.itemconfig(self._logs_bg, fill=C_BTN_BG)
+        self.cv.itemconfig(self._close_bg, fill=C_BTN_BG)
 
     def _draw_close(self):
-        """Круглая кнопка закрытия с крестиком."""
-        cx = W - 22
-        cy_c = H // 2
-        self._close_bounds = (cx - 16, cy_c - 16, cx + 16, cy_c + 16)
+        """Круглая кнопка выхода с крестиком (правый край)."""
+        cx, cy_c = CLOSE_CX, H / 2
+        hit = BTN_R + 2
+        self._close_bounds = (cx - hit, cy_c - hit, cx + hit, cy_c + hit)
         self._close_bg = self.cv.create_oval(
-            cx - 13, cy_c - 13, cx + 13, cy_c + 13,
-            fill=C_CLOSE_BG, outline="", tags="close"
+            cx - BTN_R, cy_c - BTN_R, cx + BTN_R, cy_c + BTN_R,
+            fill=C_BTN_BG, outline="", tags=("close", "ctl")
         )
-        d = 5
-        lw = 1
-        self.cv.create_line(cx-d, cy_c-d, cx+d, cy_c+d,
-                             fill=C_CLOSE_X, width=lw,
-                             capstyle="round", tags="close")
-        self.cv.create_line(cx-d, cy_c+d, cx+d, cy_c-d,
-                             fill=C_CLOSE_X, width=lw,
-                             capstyle="round", tags="close")
+        d = 3   # целые координаты: Tk округляет их до точек, дробные дают перекос
+        for x1, y1, x2, y2 in ((cx - d, cy_c - d, cx + d, cy_c + d),
+                               (cx - d, cy_c + d, cx + d, cy_c - d)):
+            self.cv.create_line(x1, y1, x2, y2, fill=C_BTN_FG, width=1.4,
+                                capstyle="round", tags=("close", "ctl"))
 
     def _draw_logs_button(self):
-        cx = W - 56
-        cy_c = H // 2
-        r = 13
-        self._logs_bounds = (cx - 16, cy_c - 16, cx + 16, cy_c + 16)
+        """Круглая кнопка логов со значком «список» (левый край)."""
+        cx, cy_c = LOGS_CX, H / 2
+        hit = BTN_R + 2
+        self._logs_bounds = (cx - hit, cy_c - hit, cx + hit, cy_c + hit)
         self._logs_bg = self.cv.create_oval(
-            cx - r, cy_c - r, cx + r, cy_c + r,
-            fill=C_LOG_BG, outline="", tags="logs"
+            cx - BTN_R, cy_c - BTN_R, cx + BTN_R, cy_c + BTN_R,
+            fill=C_BTN_BG, outline="", tags=("logs", "ctl")
         )
-        # Иконка "список"
-        self.cv.create_line(cx - 5, cy_c - 4, cx + 5, cy_c - 4,
-                            fill=C_LOG_X, width=1.4, capstyle="round", tags="logs")
-        self.cv.create_line(cx - 5, cy_c, cx + 5, cy_c,
-                            fill=C_LOG_X, width=1.4, capstyle="round", tags="logs")
-        self.cv.create_line(cx - 5, cy_c + 4, cx + 5, cy_c + 4,
-                            fill=C_LOG_X, width=1.4, capstyle="round", tags="logs")
+        for dy in (-3, 0, 3):
+            self.cv.create_line(cx - 4, cy_c + dy, cx + 4, cy_c + dy,
+                                fill=C_BTN_FG, width=1.3, capstyle="round",
+                                tags=("logs", "ctl"))
 
     # ── Логи (UI) ───────────────────────────────────────────────
     def _toggle_logs_window(self, _event=None):
@@ -1084,28 +1070,53 @@ class App:
             self._open_logs_window()
         return "break"
 
+    def _flat_button(self, parent, text: str, command):
+        """Плоская тёмная кнопка: tk.Button на macOS игнорирует цвета фона."""
+        btn = tk.Label(
+            parent, text=text, bg=LOG_BTN, fg=LOG_FG,
+            font=(UI_FONT, 12), padx=12, pady=5, cursor="hand2",
+        )
+        btn.bind("<Enter>", lambda _e: btn.config(bg=LOG_BTN_HV))
+        btn.bind("<Leave>", lambda _e: btn.config(bg=LOG_BTN))
+        btn.bind("<ButtonRelease-1>", lambda _e: command())
+        return btn
+
     def _open_logs_window(self):
-        self._logs_win = tk.Toplevel(self.root)
-        self._logs_win.title("WhisperMac: Логи")
-        self._logs_win.geometry("860x520")
-        self._logs_win.minsize(700, 380)
-        self._logs_win.configure(bg=BG)
-        self._logs_win.protocol("WM_DELETE_WINDOW", self._close_logs_window)
+        win = tk.Toplevel(self.root)
+        self._logs_win = win
+        win.title("WhisperMac — диктовки")
+        win.geometry("820x500")
+        win.minsize(640, 360)
+        win.configure(bg=LOG_BG)
+        win.protocol("WM_DELETE_WINDOW", self._close_logs_window)
 
-        root_frame = tk.Frame(self._logs_win, bg=BG)
-        root_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # Шапка: заголовок, счётчик, кнопки
+        header = tk.Frame(win, bg=LOG_BG)
+        header.pack(fill="x", padx=16, pady=(14, 10))
+        tk.Label(header, text="Диктовки", bg=LOG_BG, fg=LOG_FG,
+                 font=(UI_FONT, 17, "bold")).pack(side="left")
+        self._logs_count = tk.Label(header, text="", bg=LOG_BG, fg=LOG_DIM,
+                                    font=(UI_FONT, 12))
+        self._logs_count.pack(side="left", padx=(10, 0), pady=(4, 0))
+        self._flat_button(header, "Диагностика", self._open_runtime_log_file).pack(side="right")
+        self._flat_button(header, "Открыть файл", self._open_logs_file).pack(side="right", padx=(0, 6))
+        self._copy_btn = self._flat_button(header, "Копировать", self._copy_selected_log)
+        self._copy_btn.pack(side="right", padx=(0, 6))
+        self._flat_button(header, "Обновить", self._refresh_logs).pack(side="right", padx=(0, 6))
 
-        left = tk.Frame(root_frame, bg=BG)
-        left.pack(side="left", fill="both", expand=False)
-        right = tk.Frame(root_frame, bg=BG)
-        right.pack(side="right", fill="both", expand=True, padx=(10, 0))
+        body = tk.Frame(win, bg=LOG_BG)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
 
+        # Слева — список диктовок
+        left = tk.Frame(body, bg=LOG_PANEL, padx=6, pady=6)
+        left.pack(side="left", fill="y")
         self._logs_list = tk.Listbox(
             left,
-            width=46,
-            bg="#151518",
-            fg="#E8E8EA",
-            selectbackground="#2C2C31",
+            width=38,
+            bg=LOG_PANEL,
+            fg=LOG_FG,
+            font=(UI_FONT, 12),
+            selectbackground=LOG_SEL,
             selectforeground="#FFFFFF",
             activestyle="none",
             borderwidth=0,
@@ -1117,28 +1128,27 @@ class App:
         list_scroll.pack(side="right", fill="y")
         self._logs_list.bind("<<ListboxSelect>>", self._on_log_select)
 
+        # Справа — полный текст выбранной
+        right = tk.Frame(body, bg=LOG_PANEL)
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
         self._logs_text = tk.Text(
             right,
             wrap="word",
-            bg="#151518",
-            fg="#F1F1F4",
-            insertbackground="#F1F1F4",
+            bg=LOG_PANEL,
+            fg=LOG_FG,
+            font=(UI_FONT, 14),
+            insertbackground=LOG_FG,
             borderwidth=0,
             highlightthickness=0,
-            padx=10,
-            pady=10,
+            padx=16,
+            pady=14,
+            spacing2=3,
         )
+        self._logs_text.tag_configure("ts", foreground=LOG_DIM, font=(UI_FONT, 11))
         text_scroll = tk.Scrollbar(right, orient="vertical", command=self._logs_text.yview)
         self._logs_text.config(yscrollcommand=text_scroll.set)
         self._logs_text.pack(side="left", fill="both", expand=True)
         text_scroll.pack(side="right", fill="y")
-
-        controls = tk.Frame(self._logs_win, bg=BG)
-        controls.pack(fill="x", padx=10, pady=(0, 10))
-        tk.Button(controls, text="Обновить", command=self._refresh_logs).pack(side="left")
-        tk.Button(controls, text="Копировать", command=self._copy_selected_log).pack(side="left", padx=(6, 0))
-        tk.Button(controls, text="Диагностика", command=self._open_runtime_log_file).pack(side="right")
-        tk.Button(controls, text="Открыть Файл", command=self._open_logs_file).pack(side="right", padx=(0, 6))
 
         self._refresh_logs()
 
@@ -1148,6 +1158,8 @@ class App:
         self._logs_win = None
         self._logs_list = None
         self._logs_text = None
+        self._logs_count = None
+        self._copy_btn = None
         self._log_records = []
 
     def _log_file_path(self) -> Path:
@@ -1186,6 +1198,15 @@ class App:
             return cleaned
         return cleaned[: max_len - 1] + "…"
 
+    def _short_ts(self, ts: str) -> str:
+        """«2026-09-24 13:56:19» → «24.09 13:56»."""
+        try:
+            date, clock = ts.split(" ", 1)
+            _, month, day = date.split("-")
+            return f"{day}.{month} {clock[:5]}"
+        except ValueError:
+            return ts or "--"
+
     def _refresh_logs(self):
         if not self._logs_list:
             return
@@ -1193,8 +1214,10 @@ class App:
         self._log_records = self._read_log_records()
         self._logs_list.delete(0, tk.END)
         for item in self._log_records:
-            ts = item["ts"] or "--"
-            self._logs_list.insert(tk.END, f"{ts} · {self._log_preview(item['text'])}")
+            ts = self._short_ts(item["ts"])
+            self._logs_list.insert(tk.END, f" {ts}   {self._log_preview(item['text'], 60)}")
+        if self._logs_count:
+            self._logs_count.config(text=_plural_records(len(self._log_records)))
         if self._log_records:
             idx = prev_idx if prev_idx is not None and prev_idx < len(self._log_records) else 0
             self._logs_list.selection_set(idx)
@@ -1222,8 +1245,9 @@ class App:
         if idx is None:
             return
         item = self._log_records[idx]
-        header = f"{item['ts']}\n\n" if item["ts"] else ""
-        self._logs_text.insert("1.0", header + item["text"])
+        if item["ts"]:
+            self._logs_text.insert("1.0", f"{item['ts']}\n\n", "ts")
+        self._logs_text.insert(tk.END, item["text"])
 
     def _copy_selected_log(self):
         idx = self._selected_log_index()
@@ -1232,6 +1256,10 @@ class App:
         item = self._log_records[idx]
         if self._copy_to_clipboard(item["text"]):
             log("Лог скопирован в буфер")
+            btn = self._copy_btn
+            if btn:
+                btn.config(text="Скопировано")
+                btn.after(1200, lambda: btn.winfo_exists() and btn.config(text="Копировать"))
 
     def _open_logs_file(self):
         subprocess.run(["open", str(self._log_file_path())], check=False)
@@ -1298,7 +1326,8 @@ class App:
         if current_bundle and not self._is_excluded_bundle(current_bundle):
             self.target = current_bundle
         self.recording = True
-        self._set_mic_color(recording=True)
+        self._apply_state_style()
+        self._kick_anim()
         log(
             f"Конфиг: chunk={CHUNK_SEC:.1f}s, poll={WORKER_POLL_SEC:.2f}s, "
             f"final-pass={FINAL_PASS_MIN_SEC:.0f}-{FINAL_PASS_MAX_SEC:.0f}s"
@@ -1320,6 +1349,15 @@ class App:
             err = str(ex).lower()
             if any(k in err for k in ("permission", "not permitted", "unauthorized", "access")):
                 self._open_privacy_panel("Microphone")
+            # Без этого флаг записи оставался включённым: пилюля зависала
+            # красной, а следующий клик уводил её в вечную «обработку».
+            self.recording = False
+            if self.stream:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+                self.stream = None
             self._reset()
             return
         if ENGINE == "groq" and GROQ_API_KEY:
@@ -1337,7 +1375,8 @@ class App:
             self.stream.close()
             self.stream = None
         self.processing = True
-        self._set_mic_color(recording=False)
+        self._apply_state_style()
+        self._kick_anim()
 
     # ── Аудио-коллбэк (real-time FFT для эквалайзера) ───────────
     def _audio_cb(self, indata, frames, time_info, status):
@@ -1348,6 +1387,13 @@ class App:
         if len(frame) < 64:
             return
 
+        # Дальше только визуализация: её сбой не должен ронять поток записи.
+        try:
+            self._update_eq_levels(frame)
+        except Exception:  # noqa: BLE001
+            self._eq_levels[:] = 0
+
+    def _update_eq_levels(self, frame: np.ndarray):
         # Сначала проверяем реальную громкость
         rms = float(np.sqrt(np.mean(frame ** 2)))
         self._rms_smooth = (
@@ -1359,15 +1405,18 @@ class App:
             self._eq_levels[:] = 0
             return
 
-        # FFT → частотные полосы
-        windowed = frame * np.hanning(len(frame))
-        fft_vals  = np.abs(np.fft.rfft(windowed))
-        n_bins    = len(fft_vals)
+        # FFT → полосы по лог-шкале (окно и границы считаются один раз)
+        n = len(frame)
+        if self._eq_window is None or len(self._eq_window) != n:
+            self._eq_window = np.hanning(n).astype(np.float32)
+            self._eq_band_idx = _eq_band_bins(n)
+        fft_vals = np.abs(np.fft.rfft(frame * self._eq_window))
 
-        levels = np.array([
-            np.mean(fft_vals[n_bins * i // BAR_COUNT : n_bins * (i+1) // BAR_COUNT])
-            for i in range(BAR_COUNT)
-        ], dtype=np.float32)
+        # Высокие полосы тише низких — поднимаем их наклоном, чтобы края жили
+        levels = np.array(
+            [fft_vals[a:b].mean() for a, b in self._eq_band_idx],
+            dtype=np.float32,
+        ) * EQ_BAND_TILT
 
         peak = levels.max()
         if peak > 1e-6:
@@ -1380,7 +1429,8 @@ class App:
             )
             # Чуть поднимаем средние уровни, чтобы анимация читалась живее.
             amplitude = amplitude ** 0.72
-            self._eq_levels[:] = (shape * amplitude).astype(np.float32)
+            # Зеркально: низкие частоты в центре, высокие к краям
+            self._eq_levels[:] = (shape * EQ_ENVELOPE * amplitude)[EQ_MIRROR]
         else:
             self._eq_levels[:] = 0
 
@@ -1726,7 +1776,7 @@ class App:
         def restore():
             try:
                 self.root.attributes("-topmost", True)
-                self.root.attributes("-alpha", 0.96)
+                self.root.attributes("-alpha", WIN_ALPHA)
                 self.root.lift()
             except Exception:
                 pass
@@ -1824,13 +1874,20 @@ class App:
     def _reset(self):
         self.processing  = False
         self._eq_levels[:] = 0
-        self._set_mic_color(recording=False)
+        self._apply_state_style()
+        self._kick_anim()
 
     # ── Анимация ────────────────────────────────────────────────
+    def _kick_anim(self):
+        """Запускает цикл анимации, если он стоит. В покое цикл не крутится."""
+        if not self._anim_running:
+            self._anim_running = True
+            self.root.after(0, self._tick)
+
     def _tick(self):
         self._frame += 1
         t  = self._frame * 0.12
-        cy = H // 2
+        cy = H / 2
 
         if self.recording:
             # Attack/decay smoothing для ощущения VU-метра
@@ -1850,25 +1907,25 @@ class App:
                     ) * EQ_WOBBLE_MAX * energy
                 level = min(1.0, self._eq_smooth[i] + wobble)
                 h = BAR_MIN + level * BAR_MAX
-                self.cv.coords(b, bx, cy - h, bx + BAR_W, cy + h)
-                self.cv.itemconfig(b, fill=C_REC)
+                self.cv.coords(b, bx, cy - h, bx, cy + h)
 
         elif self.processing:
+            # Волна расходится от центра к краям
+            mid = (BAR_COUNT - 1) / 2
             for i, (b, bx) in enumerate(self.bars):
-                h = BAR_MIN + abs(math.sin(t * 4.0 + i * 0.5)) * BAR_MAX * 0.55
-                self.cv.coords(b, bx, cy - h, bx + BAR_W, cy + h)
-                self.cv.itemconfig(b, fill=C_PROC)
+                h = BAR_MIN + abs(math.sin(t * 4.0 - abs(i - mid) * 0.7)) * BAR_MAX * 0.55
+                self.cv.coords(b, bx, cy - h, bx, cy + h)
 
-        else:
+        elif self.ready:
+            # Покой: бары-точки рисуем один раз и останавливаем цикл.
+            # Раньше он перерисовывал неподвижные бары 30 раз в секунду.
             for b, bx in self.bars:
-                self.cv.coords(b, bx, cy - BAR_MIN, bx + BAR_W, cy + BAR_MIN)
-                self.cv.itemconfig(b, fill=C_IDLE)
+                self.cv.coords(b, bx, cy - BAR_MIN, bx, cy + BAR_MIN)
+            self._anim_running = False
+            return
 
         if not self.ready:
-            self.cv.itemconfig(
-                self.spinner,
-                text="◜◝◞◟"[self._frame // 4 % 4]
-            )
+            self.cv.itemconfig(self.spinner, start=(90 - self._frame * 12) % 360)
 
         self.root.after(33, self._tick)
 
@@ -1902,7 +1959,9 @@ class App:
     def _on_ready(self):
         self.ready = True
         self.cv.itemconfig(self.spinner, state="hidden")
-        self.cv.itemconfig("mic",        state="normal")
+        self.cv.itemconfig("bar", state="normal")
+        self._apply_state_style()
+        self._kick_anim()
 
     def run(self):
         log("WhisperMac запущен")
