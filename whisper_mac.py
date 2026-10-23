@@ -64,6 +64,28 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _load_config_file() -> None:
+    """Личные настройки из ~/.config/whispermac/env (KEY=VALUE, # — комментарий).
+
+    Файл вне репозитория, его значения перекрывают умолчания лаунчера:
+    .app не видит переменные окружения оболочки, а словарь терминов и
+    режим приватности не должны лежать в публичном форке.
+    """
+    path = Path(os.getenv("WHISPERMAC_CONFIG", str(Path.home() / ".config" / "whispermac" / "env")))
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ[key.strip()] = value.strip()
+
+
+_load_config_file()
+
 # Отключаем телеметрию Hugging Face по умолчанию.
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
@@ -95,7 +117,10 @@ SILENCE_SKIP_NO_SPEECH = min(
 )
 SILENCE_SKIP_MAX_CHARS = int(max(8, _env_float("WHISPERMAC_SILENCE_SKIP_MAX_CHARS", 36)))
 FINAL_TEMPERATURES = (0.0, 0.2, 0.4, 0.6)
-HOTWORDS_PROMPT = "WhisperMac, Whisper Flow, Miro, Zoom, Claude Code, ChatGPT."
+HOTWORDS_PROMPT = os.getenv(
+    "WHISPERMAC_HOTWORDS",
+    "WhisperMac, Whisper Flow, Miro, Zoom, Claude Code, ChatGPT.",
+)
 PASTE_SHORTCUT_MODE = os.getenv("WHISPERMAC_PASTE_SHORTCUT_MODE", "auto").strip().lower()
 
 # ── Движок транскрипции ─────────────────────────────

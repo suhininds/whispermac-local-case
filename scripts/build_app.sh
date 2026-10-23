@@ -123,7 +123,8 @@ clang \
 chmod +x "$APP_DIR/Contents/MacOS/WhisperMac"
 
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_DIR" >/dev/null
+  # постоянная подпись (WHISPERMAC_CODESIGN_IDENTITY) сохраняет доступы TCC между пересборками
+  codesign --force --deep --sign "${WHISPERMAC_CODESIGN_IDENTITY:--}" "$APP_DIR" >/dev/null
 fi
 
 LAUNCH_APP="$APP_DIR"
